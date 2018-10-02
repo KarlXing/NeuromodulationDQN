@@ -43,23 +43,19 @@ class ReplayMemory(object):
         self.capacity = capacity
         self.memory = []
         self.position = 0
-
     def push(self, *args):
         if len(self.memory) < self.capacity:
             self.memory.append(None)
         self.memory[self.position] = Transition(*args)
         self.position = (self.position + 1) % self.capacity
-
     def sample(self, batch_size):
         return random.sample(self.memory, batch_size)
-
     def __len__(self):
         return len(self.memory)
 
 ###############################################
 # define model
 class DQN(nn.Module):
-
     def __init__(self):
         super(DQN, self).__init__()
         self.conv1 = nn.Conv2d(3, 32, kernel_size = 8, stride = 4)
@@ -67,7 +63,6 @@ class DQN(nn.Module):
         self.conv3 = nn.Conv2d(64, 64, kernel_size = 3, stride = 1)
         self.f1 = nn.Linear(22*16*64, 512)
         self.f2 = nn.Linear(512, 9)
-
     def forward(self, x):
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
@@ -88,11 +83,11 @@ EPS_DECAY = 200
 TARGET_UPDATE = 20
 
 policy_net = DQN().to(device)
-target_net = DQN().to(device)
-target_net.load_state_dict(policy_net.state_dict())
-target_net.eval()
+with torch.no_grad():
+    target_net = DQN().to(device)
+    target_net.load_state_dict(policy_net.state_dict())
 
-optimizer = optim.RMSprop(policy_net.parameters())
+optimizer = optim.RMSprop(policy_net.parameters(), lr = 0.0001)
 memory = ReplayMemory(100000)
 
 steps_done = 0
@@ -105,10 +100,41 @@ def select_action(state):
     steps_done += 1
     if sample > eps_threshold:
         with torch.no_grad():
-            state = torch.from_numpy(np.transpose(state,(2,0,1))).float().unsqueeze(0)
-            return policy_net(state).max(1)[1][0]
+            state = torch.from_numpy(np.transpose(state,(2,0,1))).float().unsqueeze(0).to(device)
+            return policy_net(state).max(1)[1][0].item()
     else:
-        return torch.tensor([[random.randrange(9)]], device = device, dtype = torch.long)[0][0]
+        return torch.tensor([[random.randrange(9)]])[0][0].item()
+
+
+
+# optimize_model works
+# def optimize_model():
+#     if len(memory) < BATCH_SIZE:
+#         return
+#     transitions = memory.sample(BATCH_SIZE)
+#     batch = Transition(*zip(*transitions))
+#     non_final_mask = torch.tensor(tuple(map(lambda s: s is not None,
+#                                     batch.next_state)), device = device, dtype = torch.uint8)
+#     non_final_next_states = torch.from_numpy(np.transpose(np.asarray([s for s in batch.next_state if s is not None]),
+#                                     (0,3,1,2))).float().to(device)
+#     state_batch = torch.from_numpy(np.transpose(batch.state,(0,3,1,2))).float().to(device)
+#     reward_batch = torch.tensor(batch.reward, device = device)
+#     action_batch = torch.tensor([[s] for s in batch.action], device = device)
+#     state_action_values = policy_net(state_batch).gather(1, action_batch)
+#     next_state_values = torch.zeros(BATCH_SIZE, device=device)
+#     with torch.no_grad():
+#         next_state_values[non_final_mask] = target_net(non_final_next_states).max(1)[0].detach()
+#     expected_state_action_values = (next_state_values * GAMMA) + reward_batch
+#     loss = F.smooth_l1_loss(state_action_values, expected_state_action_values.unsqueeze(1))
+#     optimizer.zero_grad()
+#     loss.backward()
+#     for param in policy_net.parameters():
+#         param.grad.data.clamp_(-1, 1)
+#     optimizer.step()
+    # loss_cpu = loss.data.cpu()
+    # # del loss and outputs to keep memory
+
+    # # return loss_cpu
 
 
 def optimize_model():
@@ -116,53 +142,113 @@ def optimize_model():
         return
     transitions = memory.sample(BATCH_SIZE)
     batch = Transition(*zip(*transitions))
-
     non_final_mask = torch.tensor(tuple(map(lambda s: s is not None,
                                     batch.next_state)), device = device, dtype = torch.uint8)
-    non_final_next_states = torch.from_numpy(np.transpose([s for s in batch.next_state if s is not None],
-                                    (0,3,1,2))).float()
-
-    state_batch = torch.from_numpy(np.transpose(batch.state,(0,3,1,2))).float()
-    reward_batch = torch.tensor(batch.reward)
-    action_batch = torch.tensor([[s] for s in batch.action])
-
+    non_final_next_states = torch.from_numpy(np.transpose(np.asarray([s for s in batch.next_state if s is not None]),
+                                    (0,3,1,2))).float().to(device)
+    state_batch = torch.from_numpy(np.transpose(batch.state,(0,3,1,2))).float().to(device)
+    reward_batch = torch.tensor(batch.reward, device = device)
+    action_batch = torch.tensor([[s] for s in batch.action], device = device)
     state_action_values = policy_net(state_batch).gather(1, action_batch)
-
     next_state_values = torch.zeros(BATCH_SIZE, device=device)
-    next_state_values[non_final_mask] = target_net(non_final_next_states).max(1)[0].detach()
-
+    with torch.no_grad():
+        next_state_values[non_final_mask] = target_net(non_final_next_states).max(1)[0].detach()
     expected_state_action_values = (next_state_values * GAMMA) + reward_batch
-
     loss = F.smooth_l1_loss(state_action_values, expected_state_action_values.unsqueeze(1))
     optimizer.zero_grad()
     loss.backward()
     for param in policy_net.parameters():
         param.grad.data.clamp_(-1, 1)
     optimizer.step()
-    return loss.data.cpu()
 
 
 num_episodes = 10000000
-for i_episode in range(num_episodes):
-    env.reset()
-    last_obs = env.reset()/255
-    overall_reward = 0
-    for t in count():
-        action = select_action(last_obs)
-        obs, reward, done, _ = env.step(action)
-        if done:
-            obs = None
-        else:
-            obs = obs/255
-        memory.push(last_obs, action, obs, reward)
-        last_obs = obs
-        loss = optimize_model()
-        overall_reward += reward
-        if done:
-            writer.add_scalar('data/loss', loss, i_episode)
-    writer.add_scalar('data/reward', overall_reward, i_episode)
-    if i_episode % TARGET_UPDATE == 0:
-        target_net.load_state_dict(policy_net.state_dict())
+i_episode = 0
+overall_reward = 0
+last_obs = env.reset()
+for t in count():
+    if (i_episode > num_episodes):
+        break
+    action = select_action(last_obs)
+    obs, reward, done, _ = env.step(action)
+    if done:
+        obs = None
+    memory.push(last_obs, action, obs, reward)
+    last_obs = obs
+    overall_reward += reward
+    optimize_model()
+    # if loss_cpu is not None:
+    #     writer.add_scalar('data/loss', loss_cpu, steps_done)
+    if (steps_done % 10000 == 0):
+        with torch.no_grad():
+            target_net.load_state_dict(policy_net.state_dict())
+            torch.save(policy_net.state_dict(), "/home/jinwei/Documents/Git/NeuromodulationDQN/model/model")
+    if done:
+        writer.add_scalar('data/reward', overall_reward, steps_done)
+        last_obs = env.reset()
+        i_episode += 1
+        overall_reward = 0
+        # if (i_episode % 10 == 0):
+        #     target_net.load_state_dict(policy_net.state_dict())
+        #     torch.save(policy_net.state_dict(), "/home/jinwei/Documents/Git/NeuromodulationDQN/model/model")
+        if (i_episode % 100 == 0):
+            print(str(i_episode)+" episodes")
+    
+
+
+# while(i_episode < num_episodes):
+#     if (i_episode % 100 == 0):
+#         print(str(i_episode)+" episodes")
+#     last_obs = env.reset()/255
+#     overall_reward = 0
+#     for t in count():
+#         action = select_action(last_obs)
+#         obs, reward, done, _ = env.step(action)
+#         if done:
+#             obs = None
+#         else:
+#             obs = obs/255
+#         memory.push(last_obs, action, obs, reward)
+#         del action
+#         last_obs = obs
+#         loss = optimize_model()
+#         overall_reward += reward
+#         if done:
+#             writer.add_scalar('data/loss', loss, i_episode)
+#             break
+#     writer.add_scalar('data/reward', overall_reward, i_episode)
+#     if i_episode % TARGET_UPDATE == 0:
+#         with torch.no_grad():
+#             target_net.load_state_dict(policy_net.state_dict())
+#         torch.save(policy_net.state_dict(), "/home/jinwei/Documents/Git/NeuromodulationDQN/model/model")
+
+
+# num_episodes = 10000000
+# for i_episode in range(num_episodes):
+#     if (i_episode % 100 == 0):
+#         print(str(i_episode)+" episodes")
+#     last_obs = env.reset()/255
+#     overall_reward = 0
+#     for t in count():
+#         action = select_action(last_obs)
+#         obs, reward, done, _ = env.step(action)
+#         if done:
+#             obs = None
+#         else:
+#             obs = obs/255
+#         memory.push(last_obs, action, obs, reward)
+#         del action
+#         last_obs = obs
+#         loss = optimize_model()
+#         overall_reward += reward
+#         if done:
+#             writer.add_scalar('data/loss', loss, i_episode)
+#             break
+#     writer.add_scalar('data/reward', overall_reward, i_episode)
+#     if i_episode % TARGET_UPDATE == 0:
+#         with torch.no_grad():
+#             target_net.load_state_dict(policy_net.state_dict())
+#         torch.save(policy_net.state_dict(), "/home/jinwei/Documents/Git/NeuromodulationDQN/model/model")
 
 print("Complete")
 env.render()
