@@ -103,8 +103,8 @@ class RNN(nn.Module):
 
         # process
         x = self.f2(x)
-        E_n = F.relu(torch.mm(E, self.e2e * self.mask) + x + torch.mm(E_p, self.e2i * self.mask))
-        return E_n, E
+        E_n = F.relu(torch.mm(E, self.e2e) + x + torch.mm(E_p, self.e2i))
+        return E_n
 
 
 #############################################
@@ -119,14 +119,15 @@ with torch.no_grad():
     target_net = RNN().to(device)
     target_net.load_state_dict(policy_net.state_dict())
 
-net2device(policy_net, device)
-net2device(target_net, device)
-
 optimizer = optim.RMSprop(policy_net.parameters(), lr = LR)
 memory = ReplayMemory(100000)
 
 steps_done = 0
 
+mask = torch.ones(ACTION_SPACE,ACTION_SPACE)
+for i in range(ACTION_SPACE):
+    mask[i][i] = 0.0
+mask = mask.to(device)
 
 # def select_action(state):
 #     global steps_done
@@ -140,21 +141,19 @@ steps_done = 0
 #     else:
 #         return [torch.tensor([[random.randrange(9)]])[0][0].item(), eps_threshold]
 
-def select_action(state):
+def select_action(state, E, E_p, mask):
     global steps_done
     sample = random.random()
     eps_threshold = EPS_END + (EPS_START - EPS_END) * math.exp(-1. * steps_done / EPS_DECAY)
     steps_done += 1
     with torch.no_grad():
         state = torch.from_numpy(np.transpose(state,(2,0,1))).float().unsqueeze(0).to(device)
-        values = policy_net(dqn_net(state))
-        print(values)
-        print(values.shape)
+        values = policy_net(dqn_net(state), E, E_p, mask)
     if sample > eps_threshold:
         action = values.max(1)[1][0].item()
     else:
         action = torch.tensor([[random.randrange(9)]])[0][0].item()
-    return action, eps_threshold, values.squeeze()[action].item()
+    return action, eps_threshold, values.squeeze().detach().to('cpu')
 
 
 def delta(vRWd, vRwdPre, reward):
@@ -167,15 +166,18 @@ def optimize_model():
     batch = Transition(*zip(*transitions))
     non_final_mask = torch.tensor(tuple(map(lambda s: s is not None,
                                     batch.next_state)), device = device, dtype = torch.uint8)
-    non_final_next_states = torch.from_numpy(np.transpose(np.asarray([s for s in batch.next_state if s is not None]),
+    non_final_next_states = torch.from_numpy(np.transpose(np.asarray([s[0] for s in batch.next_state if s is not None]),
                                     (0,3,1,2))).float().to(device)
+    batch_state = [x[0] for x in batch.state]
+    batch_E = torch.stack([x[1] for x in batch.state], 0).to(device)
+    batch_E_p = torch.stack([x[2] for x in batch.state], 0).to(device)
     state_batch = torch.from_numpy(np.transpose(batch.state,(0,3,1,2))).float().to(device)
     reward_batch = torch.tensor(batch.reward, device = device)
     action_batch = torch.tensor([[s] for s in batch.action], device = device)
-    state_action_values = policy_net(dqn_net(state_batch)).gather(1, action_batch)
+    state_action_values = policy_net(dqn_net(state_batch),batch_E, batch_E_p).gather(1, action_batch)
     next_state_values = torch.zeros(BATCH_SIZE, device=device)
     with torch.no_grad():
-        next_state_values[non_final_mask] = target_net(dqn_net(non_final_next_states)).max(1)[0].detach()
+        next_state_values[non_final_mask] = target_net(dqn_net(non_final_next_states), batch_E, batch_E_p).max(1)[0].detach()
     expected_state_action_values = (next_state_values * GAMMA) + reward_batch
     loss = F.smooth_l1_loss(state_action_values, expected_state_action_values.unsqueeze(1))
     optimizer.zero_grad()
@@ -187,26 +189,32 @@ def optimize_model():
 vRwd = None
 vRwdPre = None
 dRwd = 0
-
+E = 0
+E_p = 0
 num_episodes = 10000000
 i_episode = 0
 overall_reward = 0
 last_obs = env.reset()
+last_state = [last_obs, E, E_p]
 for t in count():
     if (i_episode > num_episodes):
         break
     print(last_obs.shape)
-    action, eps_threshold, vRwd = select_action(last_obs)
+    action, eps_threshold, E_n = select_action(last_obs, E, E_p)
+    E_p = E
+    E = E_n
+    vRwd = E_n[action]
     obs, reward, done, _ = env.step(action)
+    if done:
+        obs = None
+    state = [obs, E, E_p]
 
     if vRwdPre is not None:
         dRwd = 0.75*dRwd + 0.25*delta(vRwd, vRwdPre, reward)
     vRwdPre = vRwd
 
-    if done:
-        obs = None
-    memory.push(last_obs, action, obs, reward)
-    last_obs = obs
+    memory.push(last_state, action, state, reward)
+    last_state = state
     overall_reward += reward
     optimize_model()
     # if loss_cpu is not None:
@@ -222,6 +230,8 @@ for t in count():
         last_obs = env.reset()
         i_episode += 1
         overall_reward = 0
+        E = 0
+        E_p = 0
         # if (i_episode % 10 == 0):
         #     target_net.load_state_dict(policy_net.state_dict())
         #     torch.save(policy_net.state_dict(), "/home/jinwei/Documents/Git/NeuromodulationDQN/model/model")
